@@ -2,15 +2,15 @@ from __future__ import annotations
 from typing import List, Optional, Tuple, Dict
 import numpy as np
 
-# Usamos el starter code asegurando compatibilidad exacta con reglas/acciones:
-# - merges/reward/spawn como game_2048.Game2048
-# - acciones {"up","down","left","right"}
+# Compatibilidad exacta con el starter code:
 from game_2048 import Game2048  # noqa: F401
 
 ActionStr = str
 
+
 def _to_exp(v: int) -> int:
     return 0 if v <= 0 else (v.bit_length() - 1)
+
 
 def _encode_board(board: np.ndarray) -> int:
     b = 0
@@ -24,18 +24,19 @@ def _encode_board(board: np.ndarray) -> int:
             shift += 4
     return b
 
+
 def _get_nibble(b: int, idx: int) -> int:
     return (b >> (idx * 4)) & 0xF
+
 
 def _set_nibble(b: int, idx: int, val: int) -> int:
     sh = idx * 4
     return (b & ~(0xF << sh)) | ((val & 0xF) << sh)
 
+
 def _row_at(b: int, r: int) -> int:
     return (b >> (r * 16)) & 0xFFFF
 
-def _reverse_row(row: int) -> int:
-    return ((row & 0xF) << 12) | ((row & 0xF0) << 4) | ((row & 0xF00) >> 4) | ((row & 0xF000) >> 12)
 
 def _col_state(b: int, c: int) -> int:
     i0 = c
@@ -46,6 +47,7 @@ def _col_state(b: int, c: int) -> int:
             (_get_nibble(b, i1) << 4) |
             (_get_nibble(b, i2) << 8) |
             (_get_nibble(b, i3) << 12))
+
 
 def _set_col_from_state(b: int, c: int, col: int) -> int:
     i0 = c
@@ -58,14 +60,19 @@ def _set_col_from_state(b: int, c: int, col: int) -> int:
     b = _set_nibble(b, i3, (col >> 12) & 0xF)
     return b
 
+
 _CORNERS = (0, 3, 12, 15)
+
 
 class Agent:
     """
-    Agent fuerte y rápido:
-    - Moves por tablas (65536 filas)
-    - Heurística sólida
-    - Expectimax-lite (player->chance->player->heuristic) SOLO cuando el board está apretado
+    Agente optimizado (rápido y fuerte):
+    - Moves por tablas (65536 filas).
+    - Heurística sólida.
+    - Expectimax-lite SOLO cuando el board está apretado:
+        * depth2 SOLO para spawn 2 (90%).
+        * spawn 4 (10%) solo heurística (barato).
+    - Vacíos via bitmask (sin listas ni numpy.choice).
     """
 
     def __init__(self, seed: Optional[int] = None) -> None:
@@ -79,13 +86,12 @@ class Agent:
         self._move_cache: Dict[Tuple[int, int], Tuple[int, int, bool]] = {}
         self._move_cache_limit = 260000
 
-        # Estrategia: fijar "corner objetivo" cuando aparece un NUEVO max tile (estable)
+        # Corner objetivo fijado cuando aparece nuevo max tile
         self.max_seen_exp = 0
         self.corner = 0  # {0,3,12,15}
 
-        # ---- Knobs de velocidad/calidad ----
-        self.tight_depth2 = 2       # si vacíos <= esto, activa lookahead (más fuerte, más lento)
-        # spawn sampling dinámico: k=2 cuando hay muchos vacíos, si no k=3
+        # ---- Knobs velocidad/calidad ----
+        self.tight_depth2 = 2  # depth2 SOLO si vacíos <= esto (más pequeño = más rápido)
         self.p_two = 0.9
         self.p_four = 0.1
 
@@ -96,10 +102,14 @@ class Agent:
         self.row_right_reward = np.zeros(65536, dtype=np.int32)
 
         self.row_empty = np.zeros(65536, dtype=np.uint8)
-        self.row_smooth = np.zeros(65536, dtype=np.int16)  # negativo
-        self.row_mono = np.zeros(65536, dtype=np.int16)    # positivo
+        self.row_emptymask = np.zeros(65536, dtype=np.uint8)  # 4-bit mask por fila
+        self.row_smooth = np.zeros(65536, dtype=np.int16)      # negativo
+        self.row_mono = np.zeros(65536, dtype=np.int16)        # positivo
         self.row_merges = np.zeros(65536, dtype=np.uint8)
         self.row_max = np.zeros(65536, dtype=np.uint8)
+
+        # Reverse row lookup (rápido)
+        self.rev_row = np.zeros(65536, dtype=np.uint16)
 
         # Pesos snake para TOP-LEFT (rotamos via flips)
         W = (
@@ -117,6 +127,10 @@ class Agent:
             t3 = (row >> 12) & 0xF
             tiles = [t0, t1, t2, t3]
 
+            # reverse row table
+            self.rev_row[row] = np.uint16(((row & 0xF) << 12) | ((row & 0xF0) << 4) | ((row & 0xF00) >> 4) | ((row & 0xF000) >> 12))
+
+            # move left
             nz = [t for t in tiles if t != 0]
             reward = 0
             merged = []
@@ -134,17 +148,25 @@ class Agent:
                     i += 1
             merged += [0] * (4 - len(merged))
             new_row = (merged[0] | (merged[1] << 4) | (merged[2] << 8) | (merged[3] << 12))
-            self.row_left[row] = new_row
-            self.row_left_reward[row] = reward
+            self.row_left[row] = np.uint16(new_row)
+            self.row_left_reward[row] = np.int32(reward)
 
+            # empty stats
             self.row_empty[row] = tiles.count(0)
+            mask = 0
+            if t0 == 0: mask |= 1
+            if t1 == 0: mask |= 2
+            if t2 == 0: mask |= 4
+            if t3 == 0: mask |= 8
+            self.row_emptymask[row] = np.uint8(mask)
+
             self.row_max[row] = max(tiles)
 
             smooth = 0
             for k in range(3):
                 if tiles[k] and tiles[k+1]:
                     smooth -= abs(tiles[k] - tiles[k+1])
-            self.row_smooth[row] = smooth
+            self.row_smooth[row] = np.int16(smooth)
 
             inc = 0
             dec = 0
@@ -156,13 +178,13 @@ class Agent:
                     dec += x - y
                 else:
                     inc += y - x
-            self.row_mono[row] = max(inc, dec)
+            self.row_mono[row] = np.int16(max(inc, dec))
 
             merges = 0
             for k in range(len(nz) - 1):
                 if nz[k] == nz[k+1]:
                     merges += 1
-            self.row_merges[row] = merges
+            self.row_merges[row] = np.uint8(merges)
 
             for r in range(4):
                 w = W[r]
@@ -172,10 +194,11 @@ class Agent:
                 v3 = (1 << tiles[3]) if tiles[3] else 0
                 self.row_wscore[r, row] = v0*w[0] + v1*w[1] + v2*w[2] + v3*w[3]
 
+        # row_right desde tablas (usando rev_row)
         for row in range(65536):
-            rr = _reverse_row(row)
-            self.row_right[row] = _reverse_row(int(self.row_left[rr]))
-            self.row_right_reward[row] = int(self.row_left_reward[rr])
+            rr = int(self.rev_row[row])
+            self.row_right[row] = np.uint16(self.rev_row[int(self.row_left[rr])])
+            self.row_right_reward[row] = np.int32(self.row_left_reward[rr])
 
     def _move(self, b: int, action: ActionStr) -> Tuple[int, int, bool]:
         aid = 0 if action == "up" else 1 if action == "down" else 2 if action == "left" else 3
@@ -238,17 +261,48 @@ class Agent:
         self._move_cache[key] = out
         return out
 
+    def _board_empty_mask(self, b: int) -> int:
+        r0 = _row_at(b, 0); r1 = _row_at(b, 1); r2 = _row_at(b, 2); r3 = _row_at(b, 3)
+        return (int(self.row_emptymask[r0]) |
+                (int(self.row_emptymask[r1]) << 4) |
+                (int(self.row_emptymask[r2]) << 8) |
+                (int(self.row_emptymask[r3]) << 12))
+
+    def _sample_positions_from_mask(self, mask: int, k: int, seed: int) -> List[int]:
+        n = mask.bit_count()
+        if n <= k:
+            out = []
+            m = mask
+            while m:
+                lsb = m & -m
+                out.append(lsb.bit_length() - 1)
+                m ^= lsb
+            return out
+
+        start = seed & 15
+        out = []
+        for j in range(16):
+            i = (start + j) & 15
+            if (mask >> i) & 1:
+                out.append(i)
+                if len(out) == k:
+                    break
+        return out
+
+    def _spawned(self, b: int, idx: int, exp: int) -> int:
+        return b | ((exp & 0xF) << (idx * 4))
+
     def _wscore_for_corner(self, b: int, corner: int) -> int:
         r0 = _row_at(b, 0); r1 = _row_at(b, 1); r2 = _row_at(b, 2); r3 = _row_at(b, 3)
 
         if corner == 0:  # TL
             return int(self.row_wscore[0, r0] + self.row_wscore[1, r1] + self.row_wscore[2, r2] + self.row_wscore[3, r3])
         if corner == 3:  # TR
-            rr0 = _reverse_row(r0); rr1 = _reverse_row(r1); rr2 = _reverse_row(r2); rr3 = _reverse_row(r3)
+            rr0 = int(self.rev_row[r0]); rr1 = int(self.rev_row[r1]); rr2 = int(self.rev_row[r2]); rr3 = int(self.rev_row[r3])
             return int(self.row_wscore[0, rr0] + self.row_wscore[1, rr1] + self.row_wscore[2, rr2] + self.row_wscore[3, rr3])
         if corner == 12:  # BL
             return int(self.row_wscore[0, r3] + self.row_wscore[1, r2] + self.row_wscore[2, r1] + self.row_wscore[3, r0])
-        rr0 = _reverse_row(r0); rr1 = _reverse_row(r1); rr2 = _reverse_row(r2); rr3 = _reverse_row(r3)
+        rr0 = int(self.rev_row[r0]); rr1 = int(self.rev_row[r1]); rr2 = int(self.rev_row[r2]); rr3 = int(self.rev_row[r3])
         return int(self.row_wscore[0, rr3] + self.row_wscore[1, rr2] + self.row_wscore[2, rr1] + self.row_wscore[3, rr0])
 
     def _heuristic(self, b: int) -> float:
@@ -293,16 +347,6 @@ class Agent:
         self._h_cache[key] = float(val)
         return float(val)
 
-    def _empty_indices(self, b: int) -> List[int]:
-        out = []
-        for i in range(16):
-            if ((b >> (i * 4)) & 0xF) == 0:
-                out.append(i)
-        return out
-
-    def _spawned(self, b: int, idx: int, exp: int) -> int:
-        return b | ((exp & 0xF) << (idx * 4))
-
     def _action_order(self, legal: List[str]) -> List[str]:
         if self.corner == 0:
             pref = ("up", "left", "right", "down")
@@ -328,15 +372,15 @@ class Agent:
             return -80.0 if action in ("up", "right") else 0.0
         return -80.0 if action in ("up", "left") else 0.0
 
-    def _second_ply_actions(self) -> Tuple[str, str, str]:
-        # 2nd ply más rápido: 3 acciones (omitimos la más “en contra” del corner)
+    def _second_ply_actions(self) -> Tuple[str, str]:
+        # 2 acciones (más rápido)
         if self.corner == 0:
-            return ("up", "left", "right")
+            return ("up", "left")
         if self.corner == 3:
-            return ("up", "right", "left")
+            return ("up", "right")
         if self.corner == 12:
-            return ("down", "left", "right")
-        return ("down", "right", "left")
+            return ("down", "left")
+        return ("down", "right")
 
     def act(self, board: np.ndarray, legal_actions: List[str]) -> str:
         if not legal_actions:
@@ -344,7 +388,7 @@ class Agent:
 
         b = _encode_board(board)
 
-        # update corner solo cuando aparece un nuevo max tile
+        # update corner solo cuando aparece nuevo max tile
         max_e = 0
         max_pos = 0
         for i in range(16):
@@ -367,10 +411,7 @@ class Agent:
 
         actions1 = self._action_order(legal_actions)
 
-        empties_now = 0
-        for i in range(16):
-            if ((b >> (i * 4)) & 0xF) == 0:
-                empties_now += 1
+        empties_now = self._board_empty_mask(b).bit_count()
         use_depth2 = empties_now <= self.tight_depth2
 
         best_a = actions1[0]
@@ -381,8 +422,8 @@ class Agent:
             if not moved1:
                 continue
 
-            empties = self._empty_indices(b1)
-            nE = len(empties)
+            mask1 = self._board_empty_mask(b1)
+            nE = mask1.bit_count()
             if nE == 0:
                 v = float(r1) + self._heuristic(b1) + self._action_bias(a1)
                 if v > best_v:
@@ -390,15 +431,10 @@ class Agent:
                     best_a = a1
                 continue
 
-            # spawn sampling (dinámico)
+            # spawn sampling (dinámico) pero sin numpy.choice
             k = 2 if nE >= 7 else 3
-            if nE > k:
-                h = (b1 ^ (b1 >> 17) ^ (b1 >> 43)) & 0xFFFFFFFF
-                rng = np.random.default_rng(int(h))
-                idxs = rng.choice(nE, size=k, replace=False)
-                spawns = [empties[int(i)] for i in idxs]
-            else:
-                spawns = empties
+            seed = (b1 ^ (b1 >> 17) ^ (b1 >> 43)) & 0xFFFFFFFF
+            spawns = self._sample_positions_from_mask(mask1, k, int(seed))
 
             inv = 1.0 / float(len(spawns))
             exp_v = 0.0
@@ -413,6 +449,7 @@ class Agent:
                     best_v = v
                     best_a = a1
             else:
+                # Depth2 SOLO para spawn=2 (90%). Spawn=4 solo heurística (barato).
                 for pos in spawns:
                     b2 = self._spawned(b1, pos, 1)
                     best2 = -1e30
@@ -427,16 +464,7 @@ class Agent:
                     exp_v += inv * (self.p_two * best2)
 
                     b4 = self._spawned(b1, pos, 2)
-                    best4 = -1e30
-                    for a2 in self._second_ply_actions():
-                        b3, r2, moved2 = self._move(b4, a2)
-                        if moved2:
-                            vv = float(r2) + self._heuristic(b3) + 0.35 * self._action_bias(a2)
-                            if vv > best4:
-                                best4 = vv
-                    if best4 < -1e20:
-                        best4 = self._heuristic(b4)
-                    exp_v += inv * (self.p_four * best4)
+                    exp_v += inv * (self.p_four * self._heuristic(b4))
 
                 v = float(r1) + exp_v + self._action_bias(a1)
                 if v > best_v:
